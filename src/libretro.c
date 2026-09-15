@@ -1,8 +1,8 @@
-﻿#include <stdarg.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/time.h>
+#include <stddef.h>
 #include "libretro.h"
 
 #define _DATA1          0x00
@@ -73,6 +73,28 @@ static int8_t                   fa[(LCD_WIDTH + 1) * LCD_HEIGHT];
 static uint16_t                 fb[(LCD_WIDTH + 1) * LCD_HEIGHT];
 
 
+static bool shutdown_requested;
+static bool initialized;
+static uint64_t game_identity, bios_identity;
+static uint8_t *game_image;
+static size_t game_size;
+static struct {
+    uint32_t timers[5];
+    int32_t cycles;
+    uint32_t ticked, rtc_usec;
+    uint64_t emulated_usec, last_input_usec;
+    uint8_t last_input_key;
+    int32_t pressed;
+    uint32_t repeat;
+} timing = {.pressed = -1};
+
+static uint64_t fingerprint(const uint8_t *bytes, size_t size, uint64_t value)
+{
+    for (size_t i = 0; i < size; ++i)
+        value = (value ^ bytes[i]) * UINT64_C(1099511628211);
+    return value;
+}
+
 static void sys_isr(void);
 static bool sys_halt_p(void);
 static void mem_bs(uint8_t sel);
@@ -93,6 +115,7 @@ static void mem_write(uint16_t addr, uint8_t val);
     {                                                 \
         executed = cycles;                            \
         pc = _MACCTL;                                 \
+        shutdown_requested = true;                     \
         environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL); \
     }
 #include "s6502.c"
@@ -154,7 +177,7 @@ static uint8_t flash_read(uint32_t addr)
         return sys.flash[addr];
     } else {
         // Software ID or CFI
-        return flash_info[addr];
+        return addr < sizeof(flash_info) ? flash_info[addr] : 0xff;
     }
 }
 
@@ -468,7 +491,7 @@ static void mem_bs(uint8_t sel)
 static uint8_t mem_readx(uint16_t addr)
 {
     uint8_t page = addr >> 8;
-    return sys.mem_r[page][addr & 0xff];
+    return sys.mem_r[page] ? sys.mem_r[page][addr & 0xff] : sys.mem_ir[page](addr);
 }
 
 static uint8_t mem_read(uint16_t addr)
@@ -566,7 +589,7 @@ enum _key {
     KEY_PGDN       = 0x3b,
 };
 
-static uint8_t _joyk[16] = {
+static const uint8_t joypad_4980[16] = {
     [RETRO_DEVICE_ID_JOYPAD_B]      = KEY_EXIT,
     [RETRO_DEVICE_ID_JOYPAD_Y]      = KEY_HELP,
     [RETRO_DEVICE_ID_JOYPAD_SELECT] = KEY_INSERT,
@@ -584,6 +607,8 @@ static uint8_t _joyk[16] = {
     [RETRO_DEVICE_ID_JOYPAD_L3]     = KEY_A,
     [RETRO_DEVICE_ID_JOYPAD_R3]     = KEY_Z,
 };
+
+static uint8_t _joyk[16];
 
 static uint8_t _kbdk[RETROK_LAST] = {
     [RETROK_F1]        = KEY_ON_OFF,
@@ -668,22 +693,12 @@ static void sys_keydown(uint8_t key)
     if (key == 0)
         return;
 
-    //控制连续输入的频率
-    static long last_input_time = 0;
-    static uint8_t last_input_key = 0;
-
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    long current_time = (tv.tv_sec * 1000 + tv.tv_usec / 1000);
-
-    if (key == last_input_key
-        && current_time - last_input_time < vars.key_pressed_input_min_interval)
-    {
+    if (key == timing.last_input_key &&
+        timing.emulated_usec - timing.last_input_usec <
+            (uint64_t)vars.key_pressed_input_min_interval * 1000)
         return;
-    }
-
-    last_input_key = key;
-    last_input_time = current_time;
+    timing.last_input_key = key;
+    timing.last_input_usec = timing.emulated_usec;
 
     sys.ram[_SYSCON] &= 0xf7;
     sys.ram[_KEYCODE] = key | 0x80;
@@ -699,14 +714,30 @@ static void sys_keydown(uint8_t key)
 static void keyboard_cb(bool down, unsigned keycode,
                         uint32_t character, uint16_t key_modifiers)
 {
-    if (!down)
+    if (!down || keycode >= RETROK_LAST)
         return;
     sys_keydown(_kbdk[keycode]);
 }
 
-static void sys_init(const char *romdir)
+static bool read_rom(const char *directory, const char *name, uint8_t *bytes)
 {
-    static struct retro_input_descriptor inputs[] = {
+    char path[4096];
+    int count = snprintf(path, sizeof(path), "%s/%s", directory, name);
+    if (count < 0 || (size_t)count >= sizeof(path))
+        return false;
+    FILE *stream = fopen(path, "rb");
+    if (!stream)
+        return false;
+    bool valid = fread(bytes, 1, 0x200000, stream) == 0x200000;
+    valid = valid && fgetc(stream) == EOF && !ferror(stream);
+    if (fclose(stream))
+        valid = false;
+    return valid;
+}
+
+static bool sys_init(const char *romdir)
+{
+    struct retro_input_descriptor inputs[] = {
         { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "EXIT" },
         { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y, "HELP" },
         { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "INSERT" },
@@ -725,27 +756,14 @@ static void sys_init(const char *romdir)
         { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3, "Z" },
         { 0, 0, 0, 0, NULL },
     };
-    char path[512];
-    FILE *stream;
-    snprintf(path, 512, "%s/8.BIN", romdir);
-    stream = fopen(path, "r");
-    if (stream == NULL) {
-        error_msg("GAM4980: Missing 8.BIN");
-        environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-        return;
+    memcpy(_joyk, joypad_4980, sizeof(_joyk));
+    if (!read_rom(romdir, "8.BIN", sys.rom_8) ||
+        !read_rom(romdir, "E.BIN", sys.rom_e)) {
+        error_msg("GAM4980: 8.BIN and E.BIN must each contain exactly 2 MiB");
+        return false;
     }
-    fread(sys.rom_8, 0x200000, 1, stream);
-    fclose(stream);
-    snprintf(path, 512, "%s/E.BIN", romdir);
-    stream = fopen(path, "r");
-    if (stream == NULL) {
-        error_msg("GAM4980: Missing E.BIN");
-        environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-        return;
-    }
-    fread(sys.rom_e, 0x200000, 1, stream);
-    fclose(stream);
-
+    bios_identity = fingerprint(sys.rom_8, sizeof(sys.rom_8), UINT64_C(14695981039346656037));
+    bios_identity = fingerprint(sys.rom_e, sizeof(sys.rom_e), bios_identity);
     memset(sys.ram, 0x00, 0x8000);
     memset(sys.flash, 0xff, 0x200000);
     sys.flash_cmd = 0;
@@ -763,8 +781,11 @@ static void sys_init(const char *romdir)
 
     // Run initialize instructions
     // XXX: SysStart set _MTCT to 0xfe just before 'main'.
-    while (sys.ram[_MTCT] != 0xfe)
+    unsigned attempts = 0;
+    while (sys.ram[_MTCT] != 0xfe && !shutdown_requested && attempts++ < 4096)
         s6502_exec(&sys.cpu, 0x1000);
+    if (sys.ram[_MTCT] != 0xfe || shutdown_requested)
+        return false;
     sys.bk_sys_d = sys.bk_tab[0xd];
 
     if (sys.bk_sys_d == 0x0e88) { /* 4988 */
@@ -782,12 +803,13 @@ static void sys_init(const char *romdir)
         inputs[RETRO_DEVICE_ID_JOYPAD_R3].description = "S";
     }
     environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, &inputs);
+    return sys.bk_sys_d == 0x0ea8 || sys.bk_sys_d == 0x0e88;
 }
 
 static void sys_load(const uint8_t *gam, size_t size)
 {
     uint16_t start = gam[0x40] | (gam[0x41] << 8);
-    uint32_t data = gam[0x42] | gam[0x43] << 8 | gam[0x44] << 16 | gam[0x45] << 24;
+    uint32_t data = gam[0x42] | gam[0x43] << 8 | (uint32_t)gam[0x44] << 16 | (uint32_t)gam[0x45] << 24;
     uint8_t sys_hdr[16] = {
         0xc0, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00,
@@ -798,7 +820,7 @@ static void sys_load(const uint8_t *gam, size_t size)
         0xd0, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00,
-        size & 0xff, (size >> 8) & 0xff, (size >> 16) * 0xff,
+        size & 0xff, (size >> 8) & 0xff, (size >> 16) & 0xff,
         0x3d,
     };
 
@@ -861,7 +883,7 @@ static void sys_load(const uint8_t *gam, size_t size)
 
 static void sys_timer(uint32_t n)
 {
-    static uint32_t t[5] = { 0 };
+    uint32_t *t = timing.timers;
 
     for (int i = 0; i < 4; i += 1) {
         if (sys.ram[_STCON] & (1 << i)) {
@@ -966,8 +988,8 @@ static void sys_isr()
 
 static void sys_step()
 {
-    static int32_t cycles = 0;
-    static uint32_t ticked = 0;
+    int32_t cycles = timing.cycles;
+    uint32_t ticked = timing.ticked;
     uint32_t tstep = 400 * vars.cpu_rate / vars.timer_rate;
     cycles += vars.cpu_rate * 4000000 / 60;
     while (ticked + tstep < cycles) {
@@ -983,7 +1005,8 @@ static void sys_step()
         }
     }
     cycles -= ticked;
-    ticked %= tstep;
+    timing.cycles = cycles;
+    timing.ticked = ticked % tstep;
 }
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
@@ -1002,10 +1025,11 @@ unsigned retro_api_version(void)
 
 static void frame_cb(retro_usec_t usec)
 {
-    static uint32_t ms = 0;
-    ms += usec / 1000;
-    if (ms > 1000) {
-        ms -= 1000;
+    uint32_t elapsed = usec > 0 && usec <= 250000 ? (uint32_t)usec : 1000000 / 60;
+    timing.emulated_usec += elapsed;
+    timing.rtc_usec += elapsed;
+    while (timing.rtc_usec >= 1000000) {
+        timing.rtc_usec -= 1000000;
         sys_rtc();
     }
 }
@@ -1190,11 +1214,24 @@ static void apply_variables()
 
 void retro_init(void)
 {
-    char *systemdir;
+    const char *systemdir = NULL;
     char romdir[512];
-    environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &systemdir);
-    snprintf(romdir, 512, "%s/gam4980", systemdir);
-    sys_init(romdir);
+    initialized = false;
+    shutdown_requested = false;
+    memset(&sys, 0, sizeof(sys));
+    memset(&timing, 0, sizeof(timing));
+    timing.pressed = -1;
+    memset(fa, 0, sizeof(fa));
+    memset(fb, 0, sizeof(fb));
+    if (!environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &systemdir) || !systemdir)
+        return;
+    int count = snprintf(romdir, sizeof(romdir), "%s/gam4980", systemdir);
+    if (count < 0 || (size_t)count >= sizeof(romdir) || !sys_init(romdir)) {
+        shutdown_requested = true;
+        error_msg("GAM4980: system ROM initialization failed");
+        return;
+    }
+    initialized = true;
     apply_variables();
 
     // Support RetroArch cheats.
@@ -1213,15 +1250,29 @@ void retro_init(void)
 
 bool retro_load_game(const struct retro_game_info *game)
 {
+    if (!initialized)
+        return false;
     if (game == NULL)
         return true;
-    if (game->data == NULL)
+    if (!game->data || game->size < 0x46 || game->size > 0x1e0000)
         return false;
-    if (game->size > 0x1e0000) {
-        // Game too large! (>1920K)
+    const uint8_t *bytes = game->data;
+    uint32_t start = bytes[0x40] | (uint32_t)bytes[0x41] << 8;
+    uint32_t offset = bytes[0x42] | (uint32_t)bytes[0x43] << 8 |
+                      (uint32_t)bytes[0x44] << 16 | (uint32_t)bytes[0x45] << 24;
+    if (memcmp(bytes, "GAM\0", 4) || start < 0x5000 || start >= 0x9000 ||
+        start - 0x5000 >= game->size || offset > game->size ||
+        (offset & 0xfff) != 0 || (offset >> 12) + 0x210 >= 0x400)
         return false;
-    }
-    sys_load(game->data, game->size);
+    uint8_t *copy = malloc(game->size);
+    if (!copy)
+        return false;
+    memcpy(copy, bytes, game->size);
+    free(game_image);
+    game_image = copy;
+    game_size = game->size;
+    game_identity = fingerprint(copy, game_size, UINT64_C(14695981039346656037));
+    sys_load(copy, game_size);
     return true;
 }
 
@@ -1231,10 +1282,20 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
 
 void retro_deinit(void)
 {
+    retro_unload_game();
+    initialized = false;
+    shutdown_requested = false;
+    memset(&sys, 0, sizeof(sys));
+    memset(&timing, 0, sizeof(timing));
+    timing.pressed = -1;
+    game_identity = bios_identity = 0;
 }
 
 void retro_reset(void)
 {
+    retro_init();
+    if (initialized && game_image)
+        sys_load(game_image, game_size);
 }
 
 static inline void pp8(int y, int x, uint8_t p8)
@@ -1280,6 +1341,8 @@ static void blend_frame(void)
 
 void retro_run(void)
 {
+    if (!initialized || shutdown_requested)
+        return;
     bool vupdated = false;
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &vupdated) && vupdated)
         apply_variables();
@@ -1287,8 +1350,8 @@ void retro_run(void)
     input_poll_cb();
 
     // Handle joypad.
-    static int pressed = -1;
-    static int repeat = 0;
+    int pressed = timing.pressed;
+    unsigned repeat = timing.repeat;
     for (int i = 0; i < 16; i += 1) {
         if (pressed == i) {
             if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, i) == 0) {
@@ -1309,6 +1372,8 @@ void retro_run(void)
         }
     }
 
+    timing.pressed = pressed;
+    timing.repeat = repeat;
     sys_step();
 
     // Draw the screen.
@@ -1333,49 +1398,7 @@ void retro_run(void)
     video_cb(fb, LCD_WIDTH, LCD_HEIGHT, 2 * (LCD_WIDTH + 1));
 }
 
-struct __attribute__((packed)) sys_state {
-    uint8_t ram[0x8000];
-    s6502_t cpu;
-    uint8_t bk_sel;
-    uint16_t bk_tab[16];
-    uint8_t flash_cmd;
-    uint8_t flash_cycles;
-};
-
-size_t retro_serialize_size(void)
-{
-    return sizeof(struct sys_state);
-}
-
-bool retro_serialize(void *data, size_t size)
-{
-    struct sys_state state;
-    memcpy(&state.ram, sys.ram, sizeof(sys.ram));
-    state.cpu = sys.cpu;
-    state.bk_sel = sys.bk_sel;
-    for (int i = 0; i < 16; ++i)
-        state.bk_tab[i] = sys.bk_tab[i];
-    state.flash_cmd = sys.flash_cmd;
-    state.flash_cycles = sys.flash_cycles;
-    memcpy(data, &state, size);
-    return true;
-}
-
-bool retro_unserialize(const void *data, size_t size)
-{
-    struct sys_state state;
-    memcpy(&state, data, size);
-    memcpy(sys.ram, &state.ram, sizeof(sys.ram));
-    sys.cpu = state.cpu;
-    sys.bk_sel = state.bk_sel;
-    for (int i = 0; i < 16; ++i)
-        sys.bk_tab[i] = state.bk_tab[i];
-    sys.flash_cmd = state.flash_cmd;
-    sys.flash_cycles = state.flash_cycles;
-    for (int i = 0; i < 16; ++i)
-        mem_bs(i);
-    return true;
-}
+#include "retrom-state.h"
 
 void retro_cheat_reset(void) {}
 void retro_cheat_set(unsigned index, bool enabled, const char *code) {}
@@ -1387,6 +1410,10 @@ bool retro_load_game_special(unsigned game_type, const struct retro_game_info *i
 
 void retro_unload_game(void)
 {
+    free(game_image);
+    game_image = NULL;
+    game_size = 0;
+    game_identity = 0;
 }
 
 unsigned retro_get_region(void)

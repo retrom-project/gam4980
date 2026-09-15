@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "forkRepository": "https://github.com/retrom-project/gam4980",
+  "defaultBranch": "retrom/geeaa531b55e7",
+  "upstreamMirrorBranch": "main",
+  "upstreams": [
+    {
+      "role": "emulatorjs-core",
+      "repository": "https://github.com/ThisBoringWorld/gam4980",
+      "refType": "COMMIT",
+      "ref": "eeaa531b55e7127ab4b5e0bdc5ceba686df59c6a",
+      "commit": "eeaa531b55e7127ab4b5e0bdc5ceba686df59c6a"
+    },
+    {
+      "role": "emulatorjs-retroarch-linker",
+      "repository": "https://github.com/EmulatorJS/RetroArch",
+      "refType": "COMMIT",
+      "ref": "6dd4353937ef48b6ec0bfbdbb15d1c5992d86927",
+      "commit": "6dd4353937ef48b6ec0bfbdbb15d1c5992d86927"
+    }
+  ],
+  "adapterAbi": "emulatorjs-state-v1",
+  "releaseAssets": [
+    "gam4980-wasm.data",
+    "LICENSE",
+    "source.tar.gz",
+    "rpg-runtime-release.json"
+  ]
+}

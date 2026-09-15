@@ -1,0 +1,16 @@
+CC ?= cc
+AR ?= ar
+TARGET := gam4980_libretro_emscripten.bc
+CFLAGS += -O3 -std=gnu11 -fPIC
+
+.PHONY: all clean
+all: $(TARGET)
+
+$(TARGET): libretro.o
+	$(AR) rcs $@ $^
+
+libretro.o: src/libretro.c src/libretro.h src/s6502.c src/retrom-state.h
+	$(CC) $(CFLAGS) -c src/libretro.c -o $@
+
+clean:
+	rm -f libretro.o $(TARGET)

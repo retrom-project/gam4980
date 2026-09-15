@@ -363,3 +363,7 @@ MigrationBackup/
 FodyWeavers.xsd
 
 *.so
+
+# Retrom candidate builds and local verification evidence.
+.retrom-work/
+.cache/
