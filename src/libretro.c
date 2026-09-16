@@ -889,7 +889,8 @@ static void sys_timer(uint32_t n)
         if (sys.ram[_STCON] & (1 << i)) {
             t[i] += n;
             if (t[i] >= 0x100) {
-                t[i] = sys.ram[_ST1LD + i];
+                uint32_t reload = sys.ram[_ST1LD + i];
+                t[i] = reload + (t[i] - 0x100) % (0x100 - reload);
                 if (sys.ram[_TIER] & (1 << i)) {
                     sys.ram[_TISR] |= (1 << i);
                     sys.ram[_SYSCON] &= 0xf7;
@@ -901,7 +902,8 @@ static void sys_timer(uint32_t n)
     if (sys.ram[_STCTCON] & 0x10) {
         t[4] += n;
         if (t[4] >= 0x1000) {
-            t[4] = sys.ram[_CTLD];
+            uint32_t reload = sys.ram[_CTLD];
+            t[4] = reload + (t[4] - 0x1000) % (0x1000 - reload);
             if (sys.ram[_IER] & 0x02) {
                 sys.ram[_ISR] |= 0x02;
                 sys.ram[_SYSCON] &= 0xf7;
@@ -986,27 +988,32 @@ static void sys_isr()
     sys.cpu.pc = 0x0300 + idx * 4;
 }
 
-static void sys_step()
+static void sys_step(void)
 {
-    int32_t cycles = timing.cycles;
-    uint32_t ticked = timing.ticked;
-    uint32_t tstep = 400 * vars.cpu_rate / vars.timer_rate;
-    cycles += vars.cpu_rate * 4000000 / 60;
-    while (ticked + tstep < cycles) {
+    /* CPU debt and timer phase are independent: never charge a timer remainder
+       against the next frame's CPU budget, or discard a timer overshoot. */
+    int32_t remaining = timing.cycles + (int32_t)(vars.cpu_rate * 4000000 / 60);
+    uint32_t tstep = (uint32_t)(400 * vars.cpu_rate / vars.timer_rate);
+    while (remaining > 0 && !shutdown_requested) {
+        uint32_t elapsed;
         if (sys_halt_p()) {
-            ticked += tstep;
-            sys_timer(1);
+            elapsed = tstep - timing.ticked % tstep;
+            if (elapsed > (uint32_t)remaining)
+                elapsed = (uint32_t)remaining;
         } else {
-            uint32_t p = ticked / tstep;
             sys_isr();
-            ticked += s6502_exec(&sys.cpu, 0x100);
-            uint32_t q = ticked / tstep;
-            sys_timer(q - p);
+            uint32_t slice = remaining < 256 ? (uint32_t)remaining : 256;
+            elapsed = s6502_exec(&sys.cpu, slice);
+            /* A halt can be observed before the first instruction. */
+            if (!elapsed)
+                continue;
         }
+        remaining -= (int32_t)elapsed;
+        uint32_t phase = timing.ticked + elapsed;
+        sys_timer(phase / tstep);
+        timing.ticked = phase % tstep;
     }
-    cycles -= ticked;
-    timing.cycles = cycles;
-    timing.ticked = ticked % tstep;
+    timing.cycles = remaining;
 }
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)

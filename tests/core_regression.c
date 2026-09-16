@@ -73,6 +73,43 @@ static void keyboard_bounds(void)
     assert(sys.ram[_KEYCODE] == (KEY_ENTER | 0x80));
 }
 
+static void timer_remainder(void)
+{
+    sys.ram[_STCON] = 1;
+    sys.ram[_ST1LD] = 166;
+    sys.ram[_TIER] = 1;
+    timing.timers[0] = 240;
+    sys_timer(32);
+    assert(timing.timers[0] == 182);
+    assert(sys.ram[_TISR] & 1);
+    sys_timer(180);
+    assert(timing.timers[0] == 182);
+}
+
+static void timer_cadence(void)
+{
+    /* A halted CPU still clocks peripherals; frame boundaries must not lose time. */
+    sys.ram[_SYSCON] = 8;
+    sys.ram[_STCON] = 1;
+    vars.cpu_rate = vars.timer_rate = 1;
+    for (unsigned i = 0; i < 60; ++i)
+        sys_step();
+    assert(timing.timers[0] == 15); /* floor(60 * floor(4MHz / 60) / 400) %% 256 */
+    assert(timing.ticked == 360);
+}
+
+static void cpu_slice(void)
+{
+    mem_init();
+    memset(sys.ram + 0x400, 0xea, 0x400); /* project-owned straight-line NOPs */
+    sys.ram[0x800] = 0x4c;
+    sys.ram[0x801] = 0;
+    sys.ram[0x802] = 4;
+    sys.cpu.pc = 0x400;
+    assert(s6502_exec(&sys.cpu, 256) == 256);
+    assert(sys.cpu.pc == 0x480);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -82,6 +119,9 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "flash-roundtrip")) flash_roundtrip();
     else if (!strcmp(argv[1], "corrupt-state")) corrupt_state();
     else if (!strcmp(argv[1], "keyboard-bounds")) keyboard_bounds();
+    else if (!strcmp(argv[1], "timer-remainder")) timer_remainder();
+    else if (!strcmp(argv[1], "timer-cadence")) timer_cadence();
+    else if (!strcmp(argv[1], "cpu-slice")) cpu_slice();
     else return 2;
     puts(argv[1]);
     return 0;

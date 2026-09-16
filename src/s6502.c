@@ -97,6 +97,9 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
       NEXT;
     };
   _next:
+    /* Straight-line code must yield as regularly as branches and jumps. */
+    if (executed >= cycles || sys_halt_p())
+      goto _exit;
     goto *_table[READX8(pc++)];
   _00:
     BRK_HOOK;

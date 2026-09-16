@@ -25,6 +25,18 @@ Other native dictionary keys retain their upstream joypad mappings. Keyboard
 input remains independent. The upstream implementation disables the audio
 hardware; this integration does not claim sound emulation.
 
+## Frame scheduling
+
+CPU execution yields after each bounded instruction slice, including straight-line
+code, and observes HALT at instruction boundaries. CPU budget debt is separate
+from the timer phase carried between frames. Timer reloads retain overflow
+remainders instead of stretching every interrupt period. The existing 4 MHz CPU,
+10 kHz peripheral baseline and user clock-rate options are unchanged; these fixes
+are not a hardware clock calibration or a claim of universally smooth gameplay.
+
+The native regressions cover straight-line instruction budgets, one-second timer
+cadence while halted, and multiple reload overflows, in addition to state replay.
+
 ## Instant states
 
 The native `BBKST001` state is a fixed-size, little-endian snapshot with complete

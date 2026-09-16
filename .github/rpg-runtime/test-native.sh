@@ -9,7 +9,7 @@ for source in core_regression core_lifecycle; do
   "$cc" -std=gnu11 -O1 -g -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie \
     "$root/tests/$source.c" -o "$root/.retrom-work/$source"
 done
-for case_name in malformed-game state-bounds flash-roundtrip corrupt-state keyboard-bounds; do
+for case_name in malformed-game state-bounds flash-roundtrip corrupt-state keyboard-bounds timer-remainder timer-cadence cpu-slice; do
   timeout --kill-after=2s 30s "$root/.retrom-work/core_regression" "$case_name"
 done
 for case_name in invalid-inputs cross-instance incompatible-content broken-bios; do
