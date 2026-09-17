@@ -31,6 +31,17 @@ struct __attribute__((packed)) retrom_state {
     uint32_t checksum;
 };
 
+/* Keep the exact v1 layout above for a bounded backward reader. v2 wraps it
+   and adds peripheral state. The old checksum slot is reserved/zero in v2. */
+struct __attribute__((packed)) retrom_state_v2 {
+    struct retrom_state core;
+    uint32_t tone_phase[2];
+    uint32_t melody_timer_phase;
+    uint16_t melody_timer;
+    uint16_t reserved;
+    uint32_t checksum;
+};
+
 static uint32_t state_checksum(const void *data, size_t size)
 {
     const uint8_t *bytes = data;
@@ -45,17 +56,18 @@ static uint32_t state_checksum(const void *data, size_t size)
 
 size_t retro_serialize_size(void)
 {
-    return sizeof(struct retrom_state);
+    return sizeof(struct retrom_state_v2);
 }
 
 bool retro_serialize(void *data, size_t size)
 {
-    if (!data || size < sizeof(struct retrom_state))
+    if (!data || size < sizeof(struct retrom_state_v2))
         return false;
-    struct retrom_state *state = calloc(1, sizeof(*state));
-    if (!state)
+    struct retrom_state_v2 *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot)
         return false;
-    memcpy(state->magic, "BBKST001", 8);
+    struct retrom_state *state = &snapshot->core;
+    memcpy(state->magic, "BBKST002", 8);
     state->game_identity = game_identity;
     state->bios_identity = bios_identity;
     memcpy(state->ram, sys.ram, sizeof(sys.ram));
@@ -88,17 +100,18 @@ bool retro_serialize(void *data, size_t size)
     state->lcd_fg = vars.lcd_fg;
     state->lcd_ghosting = vars.lcd_ghosting;
     state->key_interval = vars.key_pressed_input_min_interval;
-    state->checksum = state_checksum(state, offsetof(struct retrom_state, checksum));
-    memcpy(data, state, sizeof(*state));
-    free(state);
+    memcpy(snapshot->tone_phase, melody.phase, sizeof(melody.phase));
+    snapshot->melody_timer_phase = melody.timer_phase;
+    snapshot->melody_timer = melody.timer;
+    snapshot->checksum = state_checksum(snapshot, offsetof(struct retrom_state_v2, checksum));
+    memcpy(data, snapshot, sizeof(*snapshot));
+    free(snapshot);
     return true;
 }
 
 static bool valid_state(const struct retrom_state *state)
 {
-    if (memcmp(state->magic, "BBKST001", 8) ||
-        state->checksum != state_checksum(state, offsetof(struct retrom_state, checksum)) ||
-        state->game_identity != game_identity || state->bios_identity != bios_identity ||
+    if (state->game_identity != game_identity || state->bios_identity != bios_identity ||
         state->bk_sel > 15 || state->bk_sys_d != sys.bk_sys_d ||
         state->flash_cmd > 3 || state->flash_cycles > 5 ||
         state->rtc_usec >= 1000000 || state->last_input_usec > state->emulated_usec ||
@@ -119,14 +132,28 @@ static bool valid_state(const struct retrom_state *state)
 
 bool retro_unserialize(const void *data, size_t size)
 {
-    if (!data || size != sizeof(struct retrom_state))
+    if (!data || (size != sizeof(struct retrom_state) && size != sizeof(struct retrom_state_v2)))
         return false;
-    struct retrom_state *state = malloc(sizeof(*state));
-    if (!state)
+    struct retrom_state_v2 *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot)
         return false;
-    memcpy(state, data, sizeof(*state));
-    if (!valid_state(state)) {
-        free(state);
+    memcpy(snapshot, data, size);
+    struct retrom_state *state = &snapshot->core;
+    bool valid;
+    if (size == sizeof(struct retrom_state)) {
+        valid = !memcmp(state->magic, "BBKST001", 8) &&
+            state->checksum == state_checksum(state, offsetof(struct retrom_state, checksum));
+        /* v1 never emulated audio. Begin at its saved timer load, with no stale
+           samples or invented phase, while preserving all existing machine state. */
+        snapshot->melody_timer = state->ram[_MTCT];
+    } else {
+        valid = !memcmp(state->magic, "BBKST002", 8) && !state->checksum && !snapshot->reserved &&
+            snapshot->checksum == state_checksum(snapshot, offsetof(struct retrom_state_v2, checksum)) &&
+            snapshot->tone_phase[0] < MELODY_MAX_PHASE && snapshot->tone_phase[1] < MELODY_MAX_PHASE &&
+            snapshot->melody_timer_phase < MELODY_SAMPLE_RATE && snapshot->melody_timer < 256;
+    }
+    if (!valid || !valid_state(state)) {
+        free(snapshot);
         return false;
     }
     memcpy(sys.ram, state->ram, sizeof(sys.ram));
@@ -168,7 +195,11 @@ bool retro_unserialize(const void *data, size_t size)
                 for (unsigned page = 0; page < 16; ++page)
                     sys.mem_r[bank * 16 + page] = NULL;
     }
+    melody_reset();
+    memcpy(melody.phase, snapshot->tone_phase, sizeof(melody.phase));
+    melody.timer_phase = snapshot->melody_timer_phase;
+    melody.timer = snapshot->melody_timer;
     shutdown_requested = false;
-    free(state);
+    free(snapshot);
     return true;
 }

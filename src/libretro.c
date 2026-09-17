@@ -39,6 +39,8 @@
 #define _ST3LD          0x229
 #define _ST4LD          0x22a
 #define _MTCT           0x22b
+#define _ML1D           0x22c
+#define _ML2D           0x22d
 #define _STCTCON        0x22e
 #define _CTLD           0x22f
 #define _ALMMIN         0x230
@@ -52,6 +54,7 @@
 #define _RTCDAYH        0x238
 #define _IER            0x23a
 #define _TIER           0x23b
+#define _PWMVOL         0x23e
 #define _AUDCON         0x23f
 #define _KEYCODE        0x24e
 #define _MACCTL         0x260
@@ -69,6 +72,7 @@ static retro_video_refresh_t    video_cb;
 static retro_input_poll_t       input_poll_cb;
 static retro_input_state_t      input_state_cb;
 static retro_audio_sample_t     audio_cb;
+static retro_audio_sample_batch_t audio_batch_cb;
 static int8_t                   fa[(LCD_WIDTH + 1) * LCD_HEIGHT];
 static uint16_t                 fb[(LCD_WIDTH + 1) * LCD_HEIGHT];
 
@@ -143,6 +147,8 @@ static struct {
     uint8_t lcd_ghosting;
     long key_pressed_input_min_interval; //按下按键的最小输入间隔(ms)
 } vars = { 1.0, 1.0, 0xd6da, 0x0000, 20, 0x0000 };
+
+#include "melody.h"
 
 static void s6502_push(uint8_t val)
 {
@@ -292,9 +298,12 @@ static uint8_t ram_read(uint16_t addr)
 
 static void ram_write(uint16_t addr, uint8_t val)
 {
+    uint8_t previous = sys.ram[addr];
     sys.ram[addr] = val;
+    melody_write(addr, val, previous);
 
-    // XXX: Disable ROM (0x400000-0x7fffff) channels and audio.
+    // The external speech-ROM/DAC handshake remains disconnected. On-chip
+    // ML1/ML2 melody playback is independent of this dictionary speech port.
     if (addr == _PB)
         sys.ram[addr] = 0;
 
@@ -990,30 +999,36 @@ static void sys_isr()
 
 static void sys_step(void)
 {
-    /* CPU debt and timer phase are independent: never charge a timer remainder
-       against the next frame's CPU budget, or discard a timer overshoot. */
-    int32_t remaining = timing.cycles + (int32_t)(vars.cpu_rate * 4000000 / 60);
+    /* Sample boundaries are also CPU deadlines. Register writes and melody IRQs
+       are observed within one 44.1 kHz sample, without a growing event queue.
+       Clock-rate options change CPU/ST throughput, never music pitch or tempo. */
+    int32_t budget = (int32_t)(vars.cpu_rate * 4000000 / 60);
+    int32_t remaining = timing.cycles + budget;
     uint32_t tstep = (uint32_t)(400 * vars.cpu_rate / vars.timer_rate);
-    while (remaining > 0 && !shutdown_requested) {
-        uint32_t elapsed;
-        if (sys_halt_p()) {
-            elapsed = tstep - timing.ticked % tstep;
-            if (elapsed > (uint32_t)remaining)
-                elapsed = (uint32_t)remaining;
-        } else {
-            sys_isr();
-            uint32_t slice = remaining < 256 ? (uint32_t)remaining : 256;
-            elapsed = s6502_exec(&sys.cpu, slice);
-            /* A halt can be observed before the first instruction. */
-            if (!elapsed)
-                continue;
+    for (unsigned sample = 0; sample < MELODY_FRAME_SAMPLES; ++sample) {
+        int32_t deadline = budget - (int32_t)((sample + 1) * (uint64_t)budget / MELODY_FRAME_SAMPLES);
+        while (remaining > deadline && !shutdown_requested) {
+            uint32_t elapsed;
+            uint32_t available = (uint32_t)(remaining - deadline);
+            if (sys_halt_p()) {
+                elapsed = tstep - timing.ticked % tstep;
+                if (elapsed > available)
+                    elapsed = available;
+            } else {
+                sys_isr();
+                elapsed = s6502_exec(&sys.cpu, available < 256 ? available : 256);
+                if (!elapsed)
+                    continue;
+            }
+            remaining -= (int32_t)elapsed;
+            uint32_t phase = timing.ticked + elapsed;
+            sys_timer(phase / tstep);
+            timing.ticked = phase % tstep;
         }
-        remaining -= (int32_t)elapsed;
-        uint32_t phase = timing.ticked + elapsed;
-        sys_timer(phase / tstep);
-        timing.ticked = phase % tstep;
+        int16_t pcm = shutdown_requested ? 0 : melody_sample();
+        melody_pcm[2 * sample] = melody_pcm[2 * sample + 1] = pcm;
     }
-    timing.cycles = remaining;
+    timing.cycles = shutdown_requested ? 0 : remaining;
 }
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
@@ -1112,6 +1127,7 @@ void retro_set_audio_sample(retro_audio_sample_t cb)
 
 void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb)
 {
+    audio_batch_cb = cb;
 }
 
 void retro_set_input_poll(retro_input_poll_t cb)
@@ -1228,6 +1244,7 @@ void retro_init(void)
     memset(&sys, 0, sizeof(sys));
     memset(&timing, 0, sizeof(timing));
     timing.pressed = -1;
+    melody_reset();
     memset(fa, 0, sizeof(fa));
     memset(fb, 0, sizeof(fb));
     if (!environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &systemdir) || !systemdir)
@@ -1295,6 +1312,7 @@ void retro_deinit(void)
     memset(&sys, 0, sizeof(sys));
     memset(&timing, 0, sizeof(timing));
     timing.pressed = -1;
+    melody_reset();
     game_identity = bios_identity = 0;
 }
 
@@ -1382,6 +1400,7 @@ void retro_run(void)
     timing.pressed = pressed;
     timing.repeat = repeat;
     sys_step();
+    melody_submit();
 
     // Draw the screen.
     uint8_t *v = sys.ram + 0x400;

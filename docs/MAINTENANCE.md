@@ -22,8 +22,10 @@ The OS initialization loop is bounded and invalid firmware fails loading.
 
 Libretro A maps only to ENTER, B only to EXIT, and the D-pad to directions.
 Other native dictionary keys retain their upstream joypad mappings. Keyboard
-input remains independent. The upstream implementation disables the audio
-hardware; this integration does not claim sound emulation.
+input remains independent. The maintained core implements two-channel melody
+audio, its timer interrupt and both libretro audio callbacks. Dictionary speech
+remains unsupported. Register evidence, reconstructed clocks and fidelity limits
+are documented in [AUDIO-INVESTIGATION.md](AUDIO-INVESTIGATION.md).
 
 ## Frame scheduling
 
@@ -39,9 +41,12 @@ cadence while halted, and multiple reload overflows, in addition to state replay
 
 ## Instant states
 
-The native `BBKST001` state is a fixed-size, little-endian snapshot with complete
+The native `BBKST002` state is a fixed-size, little-endian snapshot with complete
 RAM, Flash, CPU registers, memory banks, timer/RTC remainders, input repeat state,
-LCD persistence/pixels and core options. It contains no process pointers or BIOS.
+LCD persistence/pixels, core options and melody phases/counter. It contains no
+process pointers or BIOS. Existing complete `BBKST001` states remain readable;
+the reader initializes their previously absent audio phase without discarding
+the saved machine state.
 A checksum rejects corruption before mutation, and fingerprints bind it to the
 loaded game and BIOS. Restoring reconstructs memory mappings, including Flash
 identification mode. Upstream partial snapshots are intentionally unsupported.
@@ -54,7 +59,9 @@ Run `.github/rpg-runtime/test-native.sh`. Tests use project-owned synthetic
 instructions, never inherited commercial games or the operator's firmware.
 They cover malformed input, bounds, corruption without state mutation, Flash,
 keyboard bounds, actual CPU execution, fresh-instance deterministic continuation,
-cross-game rejection and short firmware rejection.
+cross-game rejection and short firmware rejection. Audio cases also verify
+callback delivery, melody IRQ dispatch, channel/volume controls, rate independence,
+reset and byte-identical PCM continuation in a fresh instance.
 
 Use Retrom `pfb-core-build CORE=gam4980` for candidate bytes. Its entry point is
 `.github/rpg-runtime/build-candidate.sh <absolute-empty-output-directory>`.
