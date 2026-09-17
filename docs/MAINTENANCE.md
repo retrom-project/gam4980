@@ -1,0 +1,74 @@
+# GAM4980 browser core maintenance
+
+## Sources and ownership
+
+The upstream mirror is ThisBoringWorld/gam4980 at
+`eeaa531b55e7127ab4b5e0bdc5ceba686df59c6a`. The maintained baseline is
+`retrom/geeaa531b55e7`; `main` remains an upstream mirror.
+`retrom-fork.json` is the machine-readable source and artifact contract.
+
+The browser build links the libretro core to the pinned EmulatorJS RetroArch
+commit recorded in that file, using the immutable Emscripten SDK image in the
+build recipe. It produces a single-threaded EmulatorJS 4.2.3 core.
+Retrom identifies the platform as `bbkrpg` and the core/Target as `gam4980`.
+
+## Input and firmware
+
+The core accepts original single-file `.gam` packages with a valid GAM header,
+an in-range entry point and data bank offset, bounded to 1920 KiB.
+It requires exactly 2 MiB each of `gam4980/8.BIN` and `gam4980/E.BIN` in the
+frontend system directory. Firmware is user-supplied and excluded from artifacts.
+The OS initialization loop is bounded and invalid firmware fails loading.
+
+Libretro A maps only to ENTER, B only to EXIT, and the D-pad to directions.
+Other native dictionary keys retain their upstream joypad mappings. Keyboard
+input remains independent. The maintained core implements two-channel melody
+audio, its timer interrupt and both libretro audio callbacks. Dictionary speech
+remains unsupported. Register evidence, reconstructed clocks and fidelity limits
+are documented in [AUDIO-INVESTIGATION.md](AUDIO-INVESTIGATION.md).
+
+## Frame scheduling
+
+CPU execution yields after each bounded instruction slice, including straight-line
+code, and observes HALT at instruction boundaries. CPU budget debt is separate
+from the timer phase carried between frames. Timer reloads retain overflow
+remainders instead of stretching every interrupt period. The existing 4 MHz CPU,
+10 kHz peripheral baseline and user clock-rate options are unchanged; these fixes
+are not a hardware clock calibration or a claim of universally smooth gameplay.
+
+The native regressions cover straight-line instruction budgets, one-second timer
+cadence while halted, and multiple reload overflows, in addition to state replay.
+
+## Instant states
+
+The native `BBKST002` state is a fixed-size, little-endian snapshot with complete
+RAM, Flash, CPU registers, memory banks, timer/RTC remainders, input repeat state,
+LCD persistence/pixels, core options and melody phases/counter. It contains no
+process pointers or BIOS. Existing complete `BBKST001` states remain readable;
+the reader initializes their previously absent audio phase without discarding
+the saved machine state.
+A checksum rejects corruption before mutation, and fingerprints bind it to the
+loaded game and BIOS. Restoring reconstructs memory mappings, including Flash
+identification mode. Upstream partial snapshots are intentionally unsupported.
+The Provider gives this core its own versioned checkpoint format and applies its
+shared transport compression exactly once.
+
+## Verification and candidate builds
+
+Run `.github/rpg-runtime/test-native.sh`. Tests use project-owned synthetic
+instructions, never inherited commercial games or the operator's firmware.
+They cover malformed input, bounds, corruption without state mutation, Flash,
+keyboard bounds, actual CPU execution, fresh-instance deterministic continuation,
+cross-game rejection and short firmware rejection. Audio cases also verify
+callback delivery, melody IRQ dispatch, channel/volume controls, rate independence,
+reset and byte-identical PCM continuation in a fresh instance.
+
+Use Retrom `pfb-core-build CORE=gam4980` for candidate bytes. Its entry point is
+`.github/rpg-runtime/build-candidate.sh <absolute-empty-output-directory>`.
+The source archive is deterministic and explicitly excludes upstream ROM/BIOS
+examples, local evidence and build outputs. Candidate metadata records the
+actual branch, commit, dirty state and source digest; it is not a release pin.
+
+A release requires the matching Retrom product acceptance case before tagging.
+Publish immutable core artifacts first, then pin the verified runtime Provider,
+then update Retrom's production lock and repeat the same product checks.
